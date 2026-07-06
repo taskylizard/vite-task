@@ -102,7 +102,7 @@ notify = "8.0.0"
 path-clean = "1.0.1"
 pathdiff = "0.2.3"
 petgraph = "0.8.2"
-phf = { version = "0.13.0", features = ["macros"] }
+phf = { version = "0.14.0", features = ["macros"] }
 portable-pty = "0.9.0"
 pretty_assertions = "1.4.1"
 pty_terminal = { path = "crates/pty_terminal" }
@@ -112,7 +112,7 @@ ratatui = "0.30.0"
 rayon = "1.10.0"
 ref-cast = "1.0.24"
 regex = "1.11.3"
-rusqlite = "0.39.0"
+rusqlite = "0.40.0"
 rustc-hash = "2.1.1"
 # SeccompAction::UserNotif (SECCOMP_RET_USER_NOTIF) was added after the latest published release (v0.5.0)
 seccompiler = { git = "https://github.com/rust-vmm/seccompiler", rev = "08587106340b8e3cb361c7561411510039436857" }
@@ -165,7 +165,7 @@ wax = "0.7.0"
 which = "8.0.0"
 widestring = "1.2.0"
 winapi = "0.3.9"
-winsafe = { version = "0.0.27", features = ["kernel"] }
+winsafe = { version = "0.0.28", features = ["kernel"] }
 xxhash-rust = { version = "0.8.15", features = ["const_xxh3"] }
 ntest = "0.9.5"
 terminal_size = "0.4"
