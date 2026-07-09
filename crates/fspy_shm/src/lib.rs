@@ -1,98 +1,28 @@
 //! Platform shared-memory implementation for fspy channels.
 
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-use std::io;
 #[cfg(target_os = "linux")]
 use std::{future::Future, io, pin::Pin};
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
 #[cfg(target_os = "linux")]
 pub use linux::{CreatedShm, Shm, create, open};
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-use shared_memory::{Shmem, ShmemConf};
+#[cfg(target_os = "macos")]
+pub use macos::{CreatedShm, Shm, create, open};
 #[cfg(target_os = "windows")]
 pub use windows::{CreatedShm, Shm, create, open};
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+compile_error!("fspy_shm does not support this platform");
 
 /// A Linux service future that makes a shared-memory mapping available to other processes.
 #[cfg(target_os = "linux")]
 pub type ShmBroker = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'static>>;
-
-/// An owned shared-memory mapping.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-pub struct Shm {
-    inner: Shmem,
-}
-
-/// A newly created shared-memory mapping and its platform service.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-pub struct CreatedShm {
-    /// The owned shared-memory mapping.
-    pub shm: Shm,
-}
-
-/// Creates a shared-memory mapping of `size` bytes.
-///
-/// # Errors
-///
-/// Returns an error if the platform cannot create or map the region.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-pub fn create(size: usize) -> io::Result<CreatedShm> {
-    let conf = ShmemConf::new().size(size);
-
-    let inner = conf.create().map_err(io::Error::other)?;
-    Ok(CreatedShm { shm: Shm { inner } })
-}
-
-/// Opens the shared-memory mapping identified by `id`.
-///
-/// # Errors
-///
-/// Returns an error if the mapping does not exist or cannot be mapped.
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-pub fn open(id: &str, size: usize) -> io::Result<Shm> {
-    let conf = ShmemConf::new().size(size).os_id(id);
-
-    let inner = conf.open().map_err(io::Error::other)?;
-    Ok(Shm { inner })
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "windows")))]
-#[expect(clippy::len_without_is_empty, reason = "shared-memory mappings are always non-empty")]
-impl Shm {
-    /// Returns this mapping's opaque platform identifier.
-    #[must_use]
-    pub fn id(&self) -> &str {
-        self.inner.get_os_id()
-    }
-
-    /// Returns the mapped length in bytes.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Returns a raw pointer to the first mapped byte.
-    #[must_use]
-    pub fn as_ptr(&self) -> *mut u8 {
-        self.inner.as_ptr()
-    }
-
-    /// Returns the mapped bytes as a shared slice.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that no process or thread mutates the mapping for
-    /// the lifetime of the returned slice.
-    #[must_use]
-    pub unsafe fn as_slice(&self) -> &[u8] {
-        // SAFETY: The caller upholds the same synchronization contract required by `Shmem`.
-        unsafe { self.inner.as_slice() }
-    }
-}
 
 #[cfg(test)]
 mod tests {
