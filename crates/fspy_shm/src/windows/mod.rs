@@ -25,9 +25,16 @@ const BACKING_DIR: &str = "vite-task-fspy";
 /// An owned Windows shared-memory mapping.
 pub struct Shm {
     id: String,
+    // Field order is significant: unmap the view, close the mapping, then close
+    // the delete-on-close backing file.
     view: MappedView,
-    _mapping: OwnedHandle,
-    backing_file: BackingFile,
+    _mapping: Option<OwnedHandle>,
+    // Owner mappings keep this file alive until their view and mapping handle drop.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the file is retained only for RAII cleanup")
+    )]
+    backing_file: Option<File>,
 }
 
 /// A newly created shared-memory mapping.
@@ -36,7 +43,7 @@ pub struct CreatedShm {
     pub shm: Shm,
 }
 
-/// Creates a file-backed named mapping of `size` bytes.
+/// Creates a sparse, temporary file-backed named mapping of `size` bytes.
 ///
 /// # Errors
 ///
@@ -60,14 +67,14 @@ fn create_with(size: usize, mut next_name: impl FnMut() -> String) -> io::Result
 fn create_named(backing_dir: &Path, mapping_name: &str, size: u64) -> io::Result<Option<Shm>> {
     let path = backing_path(backing_dir, mapping_name)?;
     let id = encode_id(&path, mapping_name)?;
-    let backing_file = match BackingFile::create(path) {
+    let backing_file = match create_backing_file(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(None),
         Err(error) => return Err(error),
     };
-    backing_file.file.set_len(size)?;
+    initialize_backing_file(&backing_file, size)?;
 
-    let mapping = match sys::create_file_mapping(&backing_file.file, mapping_name)? {
+    let mapping = match sys::create_file_mapping(&backing_file, mapping_name)? {
         CreatedMapping::Created(mapping) => mapping,
         CreatedMapping::AlreadyExists => return Ok(None),
     };
@@ -76,29 +83,23 @@ fn create_named(backing_dir: &Path, mapping_name: &str, size: u64) -> io::Result
     })?;
     let view = MappedView::new(&mapping, len)?;
 
-    Ok(Some(Shm { id, view, _mapping: mapping, backing_file }))
+    Ok(Some(Shm { id, view, _mapping: Some(mapping), backing_file: Some(backing_file) }))
 }
 
 /// Opens the named mapping identified by `id`.
 ///
 /// # Errors
 ///
-/// Returns an error if the identifier is invalid, the owner has torn down the
-/// mapping, or its backing file has a different size.
+/// Returns an error if the identifier is invalid, the mapping is unavailable,
+/// or `size` cannot be mapped from it.
 pub fn open(id: &str, size: usize) -> io::Result<Shm> {
-    let expected_size = valid_size(size)?;
-    let DecodedId { backing_path, mapping_name } = decode_id(id)?;
-    let backing_file = BackingFile::open(backing_path)?;
-    if backing_file.file.metadata()?.len() != expected_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "shared-memory backing file has an unexpected size",
-        ));
-    }
+    valid_size(size)?;
+    let DecodedId { mapping_name, .. } = decode_id(id)?;
 
     let mapping = sys::open_file_mapping(&mapping_name)?;
     let view = MappedView::new(&mapping, size)?;
-    Ok(Shm { id: id.to_owned(), view, _mapping: mapping, backing_file })
+    drop(mapping);
+    Ok(Shm { id: id.to_owned(), view, _mapping: None, backing_file: None })
 }
 
 fn valid_size(size: usize) -> io::Result<u64> {
@@ -144,6 +145,7 @@ fn encode_id(backing_path: &Path, mapping_name: &str) -> io::Result<String> {
 }
 
 struct DecodedId {
+    #[cfg(test)]
     backing_path: PathBuf,
     mapping_name: String,
 }
@@ -172,7 +174,11 @@ fn decode_id(id: &str) -> io::Result<DecodedId> {
     let mapping_name =
         String::from_utf8(decode_id_part(encoded_mapping_name)?).map_err(|_| invalid_id())?;
     validate_id_parts(&backing_path, &mapping_name)?;
-    Ok(DecodedId { backing_path, mapping_name })
+    Ok(DecodedId {
+        #[cfg(test)]
+        backing_path,
+        mapping_name,
+    })
 }
 
 fn decode_id_part(encoded: &str) -> io::Result<Vec<u8>> {
@@ -197,71 +203,32 @@ fn invalid_id() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "invalid Windows shared-memory identifier")
 }
 
-struct BackingFile {
-    file: File,
-    owner_path: Option<PathBuf>,
+fn create_backing_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(sys::SHARE_ALL)
+        .attributes(sys::TEMPORARY)
+        .custom_flags(sys::DELETE_ON_CLOSE)
+        .open(path)
 }
 
-impl BackingFile {
-    fn create(path: PathBuf) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .share_mode(sys::SHARE_ALL)
-            .attributes(sys::TEMPORARY)
-            .open(&path)?;
-        Ok(Self { file, owner_path: Some(path) })
-    }
-
-    fn open(path: PathBuf) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .share_mode(sys::SHARE_ALL)
-            .attributes(sys::TEMPORARY)
-            .open(path)?;
-        Ok(Self { file, owner_path: None })
-    }
-
-    fn unlink(&mut self) {
-        let Some(path) = self.owner_path.take() else {
-            return;
-        };
-
-        let deletion_file = OpenOptions::new()
-            .access_mode(sys::DELETE_ACCESS)
-            .share_mode(sys::SHARE_ALL)
-            .attributes(sys::DELETE_ON_CLOSE)
-            .open(&path);
-        if let Ok(deletion_file) = deletion_file {
-            let deleted_path = deleted_path(&path);
-            if fs::rename(&path, deleted_path).is_err() {
-                let _ = fs::remove_file(&path);
-            }
-            drop(deletion_file);
-        } else {
-            let _ = fs::remove_file(path);
-        }
-    }
+fn initialize_backing_file(file: &File, size: u64) -> io::Result<()> {
+    initialize_backing_file_with(file, size, sys::set_sparse)
 }
 
-impl Drop for BackingFile {
-    fn drop(&mut self) {
-        self.unlink();
+fn initialize_backing_file_with(
+    file: &File,
+    size: u64,
+    set_sparse: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<()> {
+    if let Err(error) = set_sparse(file)
+        && !sys::is_sparse_unsupported(&error)
+    {
+        return Err(error);
     }
-}
-
-fn deleted_path(path: &Path) -> PathBuf {
-    path.with_extension(format!("deleted-{}", Uuid::new_v4()))
-}
-
-impl Drop for Shm {
-    fn drop(&mut self) {
-        // Remove the public backing-file name before the mapping handle drops,
-        // preventing opens that begin after owner teardown.
-        self.backing_file.unlink();
-    }
+    file.set_len(size)
 }
 
 #[expect(clippy::len_without_is_empty, reason = "shared-memory mappings are always non-empty")]
@@ -303,6 +270,9 @@ mod tests {
     use std::{ffi::OsString, fs, process::Command};
 
     use subprocess_test::command_for_fn;
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED,
+    };
 
     use super::*;
 
@@ -338,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_ids_and_size_mismatches_are_rejected() {
+    fn malformed_ids_and_invalid_sizes_are_rejected() {
         let owner = create(SIZE).unwrap().shm;
         let decoded = decode_id(owner.id()).unwrap();
         let encoded_path = URL_SAFE_NO_PAD.encode(
@@ -384,8 +354,7 @@ mod tests {
         }
 
         assert_eq!(open(owner.id(), 0).err().unwrap().kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(open(owner.id(), SIZE / 2).err().unwrap().kind(), io::ErrorKind::InvalidData);
-        assert_eq!(open(owner.id(), SIZE + 1).err().unwrap().kind(), io::ErrorKind::InvalidData);
+        assert!(open(owner.id(), SIZE + 1).is_err());
     }
 
     #[test]
@@ -394,10 +363,10 @@ mod tests {
         let collision_name = format!("{MAPPING_NAME_PREFIX}{}", Uuid::new_v4());
         let raw_backing_name = format!("{MAPPING_NAME_PREFIX}{}", Uuid::new_v4());
         let raw_backing_path = backing_path(&backing_dir, &raw_backing_name).unwrap();
-        let raw_backing = BackingFile::create(raw_backing_path).unwrap();
-        raw_backing.file.set_len(SIZE as u64).unwrap();
+        let raw_backing = create_backing_file(&raw_backing_path).unwrap();
+        initialize_backing_file(&raw_backing, SIZE as u64).unwrap();
         let collision_mapping =
-            match sys::create_file_mapping(&raw_backing.file, &collision_name).unwrap() {
+            match sys::create_file_mapping(&raw_backing, &collision_name).unwrap() {
                 CreatedMapping::Created(mapping) => mapping,
                 CreatedMapping::AlreadyExists => panic!("random test mapping name collided"),
             };
@@ -449,7 +418,16 @@ mod tests {
     }
 
     #[test]
-    fn owner_cleanup_removes_backing_file_after_existing_views_close() {
+    fn sender_opens_the_named_mapping_without_a_backing_file() {
+        let owner = create(SIZE).unwrap().shm;
+        let opened = open(owner.id(), SIZE).unwrap();
+
+        assert!(owner.backing_file.is_some());
+        assert!(opened.backing_file.is_none());
+    }
+
+    #[test]
+    fn owner_cleanup_deletes_backing_file_and_preserves_existing_views() {
         let owner = create(SIZE).unwrap().shm;
         let id = owner.id().to_owned();
         let DecodedId { backing_path: path, mapping_name } = decode_id(&id).unwrap();
@@ -461,12 +439,12 @@ mod tests {
         drop(owner);
 
         assert!(!path.exists());
-        assert!(open(&id, SIZE).is_err());
         // SAFETY: The mapping remains live and no other test access is concurrent.
         unsafe { opened.as_ptr().write(17) };
         // SAFETY: The preceding write is complete and the mapping remains live.
         assert_eq!(unsafe { opened.as_ptr().read() }, 17);
         drop(opened);
+        assert!(open(&id, SIZE).is_err());
 
         assert!(
             fs::read_dir(backing_dir).unwrap().all(|entry| !entry
@@ -477,12 +455,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unsupported_sparse_errors_fall_back_to_extending_the_file() {
+        for code in [ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED] {
+            let file = test_backing_file();
+            initialize_backing_file_with(&file, SIZE as u64, |_| {
+                Err(io::Error::from_raw_os_error(code.cast_signed()))
+            })
+            .unwrap();
+
+            assert_eq!(file.metadata().unwrap().len(), SIZE as u64);
+        }
+    }
+
+    #[test]
+    fn other_sparse_errors_do_not_extend_the_file() {
+        for code in [ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER] {
+            let file = test_backing_file();
+            let error = initialize_backing_file_with(&file, SIZE as u64, |_| {
+                Err(io::Error::from_raw_os_error(code.cast_signed()))
+            })
+            .unwrap_err();
+
+            assert_eq!(error.raw_os_error(), Some(code.cast_signed()));
+            assert_eq!(file.metadata().unwrap().len(), 0);
+        }
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
-    fn four_gib_mapping_supports_endpoint_access() {
+    fn four_gib_mapping_is_sparse_and_supports_endpoint_access() {
         const PRODUCTION_SIZE: usize = 4 * 1024 * 1024 * 1024;
+        const MAX_ENDPOINT_ALLOCATION: u64 = 16 * 1024 * 1024;
 
         let owner = create(PRODUCTION_SIZE).unwrap().shm;
+        let backing_file = owner.backing_file.as_ref().unwrap();
+        let (logical_size, initial_allocation) = sys::file_sizes(backing_file).unwrap();
+        assert_eq!(logical_size, PRODUCTION_SIZE as u64);
+        assert!(initial_allocation < MAX_ENDPOINT_ALLOCATION);
+
         let opened = open(owner.id(), PRODUCTION_SIZE).unwrap();
         // SAFETY: Both endpoint indexes are within the exact mapped length and
         // accesses are synchronized within this test.
@@ -492,5 +503,16 @@ mod tests {
             assert_eq!(opened.as_ptr().read(), 17);
             assert_eq!(opened.as_ptr().add(PRODUCTION_SIZE - 1).read(), 29);
         }
+
+        let (logical_size, endpoint_allocation) = sys::file_sizes(backing_file).unwrap();
+        assert_eq!(logical_size, PRODUCTION_SIZE as u64);
+        assert!(endpoint_allocation < MAX_ENDPOINT_ALLOCATION);
+    }
+
+    fn test_backing_file() -> File {
+        let backing_dir = create_backing_dir().unwrap();
+        let mapping_name = format!("{MAPPING_NAME_PREFIX}{}", Uuid::new_v4());
+        let path = backing_path(&backing_dir, &mapping_name).unwrap();
+        create_backing_file(&path).unwrap()
     }
 }
