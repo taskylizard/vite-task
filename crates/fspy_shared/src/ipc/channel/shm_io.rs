@@ -674,7 +674,10 @@ mod tests {
 
         let created = fspy_shm::create(SHM_SIZE).unwrap();
         #[cfg(target_os = "linux")]
-        let _broker = created.broker;
+        let broker_runtime =
+            tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build().unwrap();
+        #[cfg(target_os = "linux")]
+        let broker_handle = broker_runtime.spawn(created.broker);
         let shm = created.shm;
         let shm_name = shm.id().to_owned();
 
@@ -701,6 +704,12 @@ mod tests {
         for mut c in children {
             let status = c.wait().unwrap();
             assert!(status.success());
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            broker_handle.abort();
+            assert!(broker_runtime.block_on(broker_handle).unwrap_err().is_cancelled());
         }
 
         // SAFETY: All child processes have exited (waited above), so no concurrent writers exist.

@@ -28,6 +28,9 @@ ctor = { workspace = true }
 rustc-hash = { workspace = true }
 subprocess_test = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "time"] }
+
 [lints]
 workspace = true
 

@@ -139,9 +139,12 @@ impl Deref for Sender {
     }
 }
 
-#[expect(
-    clippy::non_send_fields_in_send_ty,
-    reason = "`Sender` holds a shared file lock that ensures there's no reader, so `shm` can be safely written to"
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        clippy::non_send_fields_in_send_ty,
+        reason = "`Sender` holds a shared file lock that ensures there's no reader, so `shm` can be safely written to"
+    )
 )]
 /// SAFETY: `Sender` holds a shared file lock that ensures there's no reader, so `shm` can be safely written to.
 unsafe impl Send for Sender {}
@@ -157,9 +160,12 @@ pub struct Receiver {
     shm: Shm,
 }
 
-#[expect(
-    clippy::non_send_fields_in_send_ty,
-    reason = "Receiver doesn't read or write `shm`. It only pass it to `ReceiverLockGuard` under the lock"
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(
+        clippy::non_send_fields_in_send_ty,
+        reason = "Receiver doesn't read or write `shm`. It only passes it to `ReceiverLockGuard` under the lock"
+    )
 )]
 /// SAFETY: `Receiver` doesn't read or write `shm`. It only passes it to `ReceiverLockGuard` under the lock.
 unsafe impl Send for Receiver {}
@@ -229,6 +235,8 @@ mod tests {
     #[test]
     fn smoke() {
         let created = channel(100).unwrap();
+        #[cfg(target_os = "linux")]
+        let (broker_runtime, broker_handle) = start_test_broker(created.broker);
         let conf = created.conf;
         let receiver = created.receiver;
         let cmd = command_for_fn!(conf, |conf: ChannelConf| {
@@ -238,6 +246,9 @@ mod tests {
             frame.copy_from_slice(&[4, 2]);
         });
         assert!(std::process::Command::from(cmd).status().unwrap().success());
+
+        #[cfg(target_os = "linux")]
+        stop_test_broker(&broker_runtime, broker_handle);
 
         let lock = receiver.lock().unwrap();
         let mut frames = lock.iter_frames();
@@ -252,6 +263,8 @@ mod tests {
     #[expect(clippy::print_stdout, reason = "test diagnostics")]
     fn forbid_new_senders_after_locked() {
         let created = channel(42).unwrap();
+        #[cfg(target_os = "linux")]
+        let (broker_runtime, broker_handle) = start_test_broker(created.broker);
         let conf = created.conf;
         let receiver = created.receiver;
         let _lock = receiver.lock().unwrap();
@@ -261,12 +274,16 @@ mod tests {
         });
         let output = std::process::Command::from(cmd).output().unwrap();
         assert_eq!(B(&output.stdout), B("false"));
+        #[cfg(target_os = "linux")]
+        stop_test_broker(&broker_runtime, broker_handle);
     }
 
     #[test]
     #[expect(clippy::print_stdout, reason = "test diagnostics")]
     fn forbid_new_senders_after_receiver_dropped() {
         let created = channel(42).unwrap();
+        #[cfg(target_os = "linux")]
+        let (broker_runtime, broker_handle) = start_test_broker(created.broker);
         let conf = created.conf;
         let receiver = created.receiver;
         drop(receiver);
@@ -276,11 +293,15 @@ mod tests {
         });
         let output = std::process::Command::from(cmd).output().unwrap();
         assert_eq!(B(&output.stdout), B("false"));
+        #[cfg(target_os = "linux")]
+        stop_test_broker(&broker_runtime, broker_handle);
     }
 
     #[test]
     fn concurrent_senders() {
         let created = channel(8192).unwrap();
+        #[cfg(target_os = "linux")]
+        let (broker_runtime, broker_handle) = start_test_broker(created.broker);
         let conf = created.conf;
         let receiver = created.receiver;
         for i in 0u16..200 {
@@ -300,6 +321,8 @@ mod tests {
                 B(&output.stderr)
             );
         }
+        #[cfg(target_os = "linux")]
+        stop_test_broker(&broker_runtime, broker_handle);
         let lock = receiver.lock().unwrap();
         let mut received_values: Vec<u16> = lock
             .iter_frames()
@@ -307,5 +330,24 @@ mod tests {
             .collect();
         received_values.sort_unstable();
         assert_eq!(received_values, (0u16..200).collect::<Vec<u16>>());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_test_broker(
+        broker: ShmBroker,
+    ) -> (tokio::runtime::Runtime, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let runtime =
+            tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build().unwrap();
+        let handle = runtime.spawn(broker);
+        (runtime, handle)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stop_test_broker(
+        runtime: &tokio::runtime::Runtime,
+        broker: tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        broker.abort();
+        assert!(runtime.block_on(broker).unwrap_err().is_cancelled());
     }
 }
