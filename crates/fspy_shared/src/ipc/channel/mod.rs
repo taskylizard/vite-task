@@ -4,7 +4,9 @@ mod shm_io;
 
 use std::{env::temp_dir, fs::File, io, mem::MaybeUninit, ops::Deref, path::PathBuf, sync::Arc};
 
-use fspy_shm::Shm;
+#[cfg(target_os = "linux")]
+pub use fspy_shm::ShmBroker;
+use fspy_shm::{CreatedShm, Shm};
 pub use shm_io::FrameMut;
 use shm_io::{ShmReader, ShmWriter};
 use tracing::debug;
@@ -54,16 +56,31 @@ pub struct ChannelConf {
     shm_size: usize,
 }
 
+/// A newly created IPC channel and its platform service.
+pub struct CreatedChannel {
+    /// The serializable configuration used to create senders.
+    pub conf: ChannelConf,
+    /// The receiving side of the channel.
+    pub receiver: Receiver,
+    /// The Linux service future that makes the channel mapping available to senders.
+    #[cfg(target_os = "linux")]
+    pub broker: ShmBroker,
+}
+
 /// Creates a mpsc IPC channel with one receiver and a `ChannelConf` that can be passed around processes and used to create multiple senders
 #[expect(
     clippy::missing_errors_doc,
     reason = "non-vite crate: cannot use vite_str/vite_path types"
 )]
-pub fn channel(capacity: usize) -> io::Result<(ChannelConf, Receiver)> {
+pub fn channel(capacity: usize) -> io::Result<CreatedChannel> {
     // Initialize the lock file with a unique name.
     let lock_file_path = temp_dir().join(format!("fspy_ipc_{}.lock", Uuid::new_v4()));
 
-    let shm = fspy_shm::create(capacity)?;
+    let CreatedShm {
+        shm,
+        #[cfg(target_os = "linux")]
+        broker,
+    } = fspy_shm::create(capacity)?;
 
     let conf = ChannelConf {
         lock_file_path: lock_file_path.as_os_str().into(),
@@ -72,7 +89,12 @@ pub fn channel(capacity: usize) -> io::Result<(ChannelConf, Receiver)> {
     };
 
     let receiver = Receiver::new(lock_file_path, shm)?;
-    Ok((conf, receiver))
+    Ok(CreatedChannel {
+        conf,
+        receiver,
+        #[cfg(target_os = "linux")]
+        broker,
+    })
 }
 
 impl ChannelConf {
@@ -206,7 +228,9 @@ mod tests {
 
     #[test]
     fn smoke() {
-        let (conf, receiver) = channel(100).unwrap();
+        let created = channel(100).unwrap();
+        let conf = created.conf;
+        let receiver = created.receiver;
         let cmd = command_for_fn!(conf, |conf: ChannelConf| {
             let sender = conf.sender().unwrap();
             let frame_size = NonZeroUsize::new(2).unwrap();
@@ -227,7 +251,9 @@ mod tests {
     #[test]
     #[expect(clippy::print_stdout, reason = "test diagnostics")]
     fn forbid_new_senders_after_locked() {
-        let (conf, receiver) = channel(42).unwrap();
+        let created = channel(42).unwrap();
+        let conf = created.conf;
+        let receiver = created.receiver;
         let _lock = receiver.lock().unwrap();
 
         let cmd = command_for_fn!(conf, |conf: ChannelConf| {
@@ -240,7 +266,9 @@ mod tests {
     #[test]
     #[expect(clippy::print_stdout, reason = "test diagnostics")]
     fn forbid_new_senders_after_receiver_dropped() {
-        let (conf, receiver) = channel(42).unwrap();
+        let created = channel(42).unwrap();
+        let conf = created.conf;
+        let receiver = created.receiver;
         drop(receiver);
 
         let cmd = command_for_fn!(conf, |conf: ChannelConf| {
@@ -252,7 +280,9 @@ mod tests {
 
     #[test]
     fn concurrent_senders() {
-        let (conf, receiver) = channel(8192).unwrap();
+        let created = channel(8192).unwrap();
+        let conf = created.conf;
+        let receiver = created.receiver;
         for i in 0u16..200 {
             let cmd = command_for_fn!((conf.clone(), i), |(conf, i): (ChannelConf, u16)| {
                 let sender = conf.sender().unwrap();

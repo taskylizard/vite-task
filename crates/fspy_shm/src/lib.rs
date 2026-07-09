@@ -1,6 +1,8 @@
 //! Behavior-neutral shared-memory facade for fspy channels.
 
 use std::io;
+#[cfg(target_os = "linux")]
+use std::{future::Future, pin::Pin};
 
 use shared_memory::{Shmem, ShmemConf};
 
@@ -9,18 +11,35 @@ pub struct Shm {
     inner: Shmem,
 }
 
+/// A Linux service future that makes a shared-memory mapping available to other processes.
+#[cfg(target_os = "linux")]
+pub type ShmBroker = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'static>>;
+
+/// A newly created shared-memory mapping and its platform service.
+pub struct CreatedShm {
+    /// The owned shared-memory mapping.
+    pub shm: Shm,
+    /// The service future that makes this mapping available to other processes.
+    #[cfg(target_os = "linux")]
+    pub broker: ShmBroker,
+}
+
 /// Creates a shared-memory mapping of `size` bytes.
 ///
 /// # Errors
 ///
 /// Returns an error if the platform cannot create or map the region.
-pub fn create(size: usize) -> io::Result<Shm> {
+pub fn create(size: usize) -> io::Result<CreatedShm> {
     let conf = ShmemConf::new().size(size);
     #[cfg(target_os = "windows")]
     let conf = conf.allow_raw(true);
 
     let inner = conf.create().map_err(io::Error::other)?;
-    Ok(Shm { inner })
+    Ok(CreatedShm {
+        shm: Shm { inner },
+        #[cfg(target_os = "linux")]
+        broker: Box::pin(std::future::pending()),
+    })
 }
 
 /// Opens the shared-memory mapping identified by `id`.
@@ -83,7 +102,7 @@ mod tests {
 
     #[test]
     fn create_and_open_are_shared() {
-        let owner = create(SIZE).unwrap();
+        let owner = create(SIZE).unwrap().shm;
         assert_eq!(owner.len(), SIZE);
         assert_eq!(owner.as_ptr() as usize % align_of::<usize>(), 0);
         // SAFETY: No writes occur while this slice is borrowed.
@@ -101,7 +120,7 @@ mod tests {
 
     #[test]
     fn mapping_is_visible_across_processes() {
-        let owner = create(SIZE).unwrap();
+        let owner = create(SIZE).unwrap().shm;
         write_byte(&owner, 0, 17);
 
         let command = command_for_fn!(owner.id().to_owned(), |id: String| {
@@ -115,7 +134,7 @@ mod tests {
 
     #[test]
     fn owner_drop_prevents_new_opens() {
-        let owner = create(SIZE).unwrap();
+        let owner = create(SIZE).unwrap().shm;
         let id = owner.id().to_owned();
         drop(owner);
 
@@ -124,7 +143,7 @@ mod tests {
 
     #[test]
     fn opened_mapping_survives_owner_drop() {
-        let owner = create(SIZE).unwrap();
+        let owner = create(SIZE).unwrap().shm;
         let id = owner.id().to_owned();
         let opened = open(&id, SIZE).unwrap();
         write_byte(&owner, 0, 17);
@@ -136,6 +155,14 @@ mod tests {
         assert_eq!(read_byte(&opened, 0), 17);
         write_byte(&opened, SIZE - 1, 29);
         assert_eq!(read_byte(&opened, SIZE - 1), 29);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn broker_remains_pending() {
+        let mut broker = create(SIZE).unwrap().broker;
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(broker.as_mut().poll(&mut context).is_pending());
     }
 
     fn read_byte(shm: &Shm, index: usize) -> u8 {

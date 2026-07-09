@@ -10,7 +10,10 @@ use std::{io, path::Path};
 use fspy_seccomp_unotify::supervisor::supervise;
 use fspy_shared::ipc::PathAccess;
 #[cfg(not(target_env = "musl"))]
-use fspy_shared::ipc::{NativeStr, channel::channel};
+use fspy_shared::ipc::{
+    NativeStr,
+    channel::{CreatedChannel, channel},
+};
 #[cfg(target_os = "macos")]
 use fspy_shared_unix::payload::Artifacts;
 use fspy_shared_unix::{
@@ -27,6 +30,40 @@ use tokio_util::sync::CancellationToken;
 #[cfg(not(target_env = "musl"))]
 use crate::ipc::{OwnedReceiverLockGuard, SHM_CAPACITY};
 use crate::{ChildTermination, Command, TrackedChild, arena::PathAccessArena, error::SpawnError};
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+struct AbortOnDropHandle<T> {
+    handle: Option<tokio::task::JoinHandle<T>>,
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+impl<T> AbortOnDropHandle<T> {
+    const fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self { handle: Some(handle) }
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+impl AbortOnDropHandle<io::Result<()>> {
+    async fn abort_and_wait(mut self) -> io::Result<()> {
+        let handle = self.handle.take().expect("broker task handle must be present");
+        handle.abort();
+        match handle.await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(io::Error::other(error)),
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+impl<T> Drop for AbortOnDropHandle<T> {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.handle {
+            handle.abort();
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct SpyImpl {
@@ -78,8 +115,15 @@ impl SpyImpl {
         let supervisor = supervise::<SyscallHandler>().map_err(SpawnError::Supervisor)?;
 
         #[cfg(not(target_env = "musl"))]
-        let (ipc_channel_conf, ipc_receiver) =
-            channel(SHM_CAPACITY).map_err(SpawnError::ChannelCreation)?;
+        let CreatedChannel {
+            conf: ipc_channel_conf,
+            receiver: ipc_receiver,
+            #[cfg(target_os = "linux")]
+                broker: shm_broker,
+        } = channel(SHM_CAPACITY).map_err(SpawnError::ChannelCreation)?;
+
+        #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+        let shm_broker_handle = AbortOnDropHandle::new(tokio::spawn(shm_broker));
 
         let payload = Payload {
             #[cfg(not(target_env = "musl"))]
@@ -145,6 +189,9 @@ impl SpyImpl {
                         child.wait().await?
                     }
                 };
+
+                #[cfg(all(target_os = "linux", not(target_env = "musl")))]
+                shm_broker_handle.abort_and_wait().await?;
 
                 let arenas = std::iter::once(exec_resolve_accesses);
                 // Stop the supervisor and collect path accesses from it.

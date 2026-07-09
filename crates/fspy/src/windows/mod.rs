@@ -8,7 +8,10 @@ use std::{
 
 use fspy_detours_sys::{DetourCopyPayloadToProcess, DetourUpdateProcessWithDll};
 use fspy_shared::{
-    ipc::{PathAccess, channel::channel},
+    ipc::{
+        PathAccess,
+        channel::{CreatedChannel, channel},
+    },
     windows::{PAYLOAD_ID, Payload},
 };
 use futures_util::FutureExt;
@@ -78,7 +81,7 @@ impl SpyImpl {
 
         command.creation_flags(CREATE_SUSPENDED);
 
-        let (channel_conf, receiver) =
+        let CreatedChannel { conf: channel_conf, receiver } =
             channel(SHM_CAPACITY).map_err(SpawnError::ChannelCreation)?;
 
         let mut spawn_success = false;

@@ -672,7 +672,10 @@ mod tests {
 
         const SHM_SIZE: usize = 1024 * 1024;
 
-        let shm = fspy_shm::create(SHM_SIZE).unwrap();
+        let created = fspy_shm::create(SHM_SIZE).unwrap();
+        #[cfg(target_os = "linux")]
+        let _broker = created.broker;
+        let shm = created.shm;
         let shm_name = shm.id().to_owned();
 
         let children: Vec<Child> = (0..CHILD_COUNT)
